@@ -1,0 +1,10 @@
+
+For deep learning, the most accepted baselines are:
+
+    MLP on engineered features.
+    1D-CNN on raw time-series or segmented windows.
+    LSTM or GRU for temporal modeling.
+    CNN-LSTM or CNN-GRU hybrids.
+    Transformer-based models in newer papers, especially when sequence length and context matter.
+
+
