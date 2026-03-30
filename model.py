@@ -7,7 +7,6 @@ class ClassicalBranch(nn.Module):
     def __init__(self, input_length=100, feature_dim=32):
         super(ClassicalBranch, self).__init__()
         # Input shape: (Batch, 1, Length) or (Batch, Length, 1). We'll assume (Batch, 1, Length) for Conv1d
-        
         # 1D-CNN: Extract local temporal patterns
         self.cnn = nn.Sequential(
             nn.Conv1d(in_channels=1, out_channels=16, kernel_size=3, padding=1),
@@ -76,7 +75,6 @@ class MultimodalQuantumFusion(nn.Module):
             for q in range(n_qubits):
                 qml.RX(scaled_inputs[q], wires=q)
 
-            
             for l in range(n_layers):
                 # Apply Rotations
                 for q in range(n_qubits):
