@@ -5,7 +5,11 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from wesad_dataset import WESADDataset
-from advanced_models import LSTMModel, CNNLSTMModel, TransformerModel, ClassicalBaseline
+from advanced_models import (
+    LSTMModel, CNNLSTMModel, TransformerModel, ClassicalBaseline, MultiScaleCNNModel,
+    MultiScaleQuantumModel, LSTMQuantumModel, CNNLSTMQuantumModel, TransformerQuantumModel,
+    HybridLoss
+)
 import time
 import json
 import numpy as np
@@ -49,7 +53,13 @@ def evaluate(model, loader, device, criterion):
         for data, label in loader:
             data, label = data.to(device), label.to(device)
             outputs = model(data)
-            total_loss += criterion(outputs, label).item()
+            if isinstance(outputs, tuple):
+                logits, entropies = outputs
+                total_loss += criterion(logits, entropies, label).item()
+                outputs = logits
+            else:
+                total_loss += criterion(outputs, label).item()
+            
             _, predicted = torch.max(outputs, 1)
             all_preds.extend(predicted.cpu().numpy())
             all_labels.extend(label.cpu().numpy())
@@ -87,11 +97,11 @@ def train_one_fold(fold_idx, model_type, args, device):
 
     # Load data
     train_ds = WESADDataset(WESAD_PATH, train_subs, window_sec=args['window_sec'],
-                            target_fs=args['target_fs'], mode='multivariate')
+                            target_fs=args['target_fs'], mode='multivariate', augment=args['augment'])
     val_ds   = WESADDataset(WESAD_PATH, val_subs,   window_sec=args['window_sec'],
-                            target_fs=args['target_fs'], mode='multivariate')
+                            target_fs=args['target_fs'], mode='multivariate', augment=False)
     test_ds  = WESADDataset(WESAD_PATH, test_subs,  window_sec=args['window_sec'],
-                            target_fs=args['target_fs'], mode='multivariate')
+                            target_fs=args['target_fs'], mode='multivariate', augment=False)
 
     print(f"  Samples — Train: {len(train_ds)} | Val: {len(val_ds)} | Test: {len(test_ds)}")
 
@@ -111,8 +121,21 @@ def train_one_fold(fold_idx, model_type, args, device):
         model = TransformerModel(num_features=5, num_classes=3).to(device)
     elif model_type == 'baseline':
         model = ClassicalBaseline(num_features=5, num_classes=3).to(device)
+    elif model_type == 'multiscale':
+        model = MultiScaleCNNModel(num_features=5, num_classes=3).to(device)
+    elif model_type == 'multiscale-quantum':
+        model = MultiScaleQuantumModel(num_features=5, num_classes=3).to(device)
+    elif model_type == 'lstm-quantum':
+        model = LSTMQuantumModel(num_features=5, num_classes=3).to(device)
+    elif model_type == 'cnn-lstm-quantum':
+        model = CNNLSTMQuantumModel(num_features=5, num_classes=3).to(device)
+    elif model_type == 'transformer-quantum':
+        model = TransformerQuantumModel(num_features=5, num_classes=3).to(device)
     else:
         raise ValueError(f"Unknown model type: {model_type}")
+
+    is_quantum = "quantum" in model_type
+
 
     optimizer = optim.AdamW(model.parameters(), lr=args['lr'], weight_decay=args['weight_decay'])
     # Monitor val_F1 (mode=max) — must match the checkpoint criterion.
@@ -123,7 +146,11 @@ def train_one_fold(fold_idx, model_type, args, device):
 
     # Label smoothing (0.1) reduces overconfidence on training subjects,
     # which is the main cross-subject generalization killer.
-    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
+    if is_quantum:
+        criterion = HybridLoss(lambda_entropy=args.get('lambda_entropy', 0.1))
+    else:
+        criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
+
 
     best_val_f1 = -1.0  # Checkpoint on F1 — val_loss is noisy with 1-subject validation
     history = {"train_loss": [], "val_loss": [], "val_acc": [], "val_f1": [], "lr": []}
@@ -136,7 +163,12 @@ def train_one_fold(fold_idx, model_type, args, device):
         for data, label in train_loader:
             data, label = data.to(device), label.to(device)
             optimizer.zero_grad()
-            loss = criterion(model(data), label)
+            outputs = model(data)
+            if is_quantum:
+                logits, entropies = outputs
+                loss = criterion(logits, entropies, label)
+            else:
+                loss = criterion(outputs, label)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -220,17 +252,23 @@ def train_one_fold(fold_idx, model_type, args, device):
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model",        type=str,   choices=['lstm', 'cnnlstm', 'transformer', 'baseline'], default='lstm')
+    parser.add_argument("--model",        type=str,   choices=[
+        'lstm', 'cnnlstm', 'transformer', 'baseline', 'multiscale',
+        'lstm-quantum', 'cnn-lstm-quantum', 'transformer-quantum', 'multiscale-quantum'
+    ], default='lstm')
+    parser.add_argument("--lambda_entropy", type=float, default=0.1, help="Weight for quantum entanglement loss")
     parser.add_argument("--epochs",       type=int,   default=50)
     parser.add_argument("--batch_size",   type=int,   default=64)
     parser.add_argument("--lr",           type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--window_sec",   type=int,   default=3)
+    parser.add_argument("--window_sec",   type=int,   default=30)
     parser.add_argument("--target_fs",    type=int,   default=100)
     parser.add_argument("--start_fold",   type=int,   default=0,
                         help="Resume from a specific fold (0-14)")
     parser.add_argument("--demo",         action="store_true",
                         help="Run only fold 0 for quick verification")
+    parser.add_argument("--augment",      action="store_true",
+                        help="Enable Noise-Aware Training (Augmentation)")
     args = vars(parser.parse_args())
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

@@ -3,6 +3,8 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import torch
 import torch.nn as nn
 import numpy as np
+import pennylane as qml
+
 
 class LSTMModel(nn.Module):
     def __init__(self, num_features=5, hidden_size=128, num_layers=2, num_classes=3, dropout=0.3):
@@ -266,6 +268,305 @@ class ClassicalBaseline(nn.Module):
         return logits
 
 
+class MultiScaleCNNModel(nn.Module):
+    def __init__(self, num_features=5, num_classes=3, out_channels=32, dropout=0.3):
+        """
+        A unified Multi-Scale 1D CNN that processes all modalities in parallel.
+        More compact than ClassicalBaseline but keeps the multi-resolution benefits.
+        """
+        super(MultiScaleCNNModel, self).__init__()
+        
+        # Parallel Multi-Scale Blocks
+        # (Batch, Channels=5, Seq)
+        self.conv3 = nn.Sequential(
+            nn.Conv1d(num_features, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm1d(out_channels),
+            nn.ReLU()
+        )
+        self.conv7 = nn.Sequential(
+            nn.Conv1d(num_features, out_channels, kernel_size=7, padding=3),
+            nn.BatchNorm1d(out_channels),
+            nn.ReLU()
+        )
+        self.conv11 = nn.Sequential(
+            nn.Conv1d(num_features, out_channels, kernel_size=11, padding=5),
+            nn.BatchNorm1d(out_channels),
+            nn.ReLU()
+        )
+        
+        # Concatenated features -> 3 * out_channels
+        self.classifier = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Linear(out_channels * 3, 128),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, num_classes)
+        )
+
+    def forward(self, x):
+        # x: (Batch, Seq, Features) -> (Batch, Features, Seq)
+        x = x.permute(0, 2, 1)
+        
+        c3 = self.conv3(x)
+        c7 = self.conv7(x)
+        c11 = self.conv11(x)
+        
+        fused = torch.cat([c3, c7, c11], dim=1)
+        logits = self.classifier(fused)
+        return logits
+
+
+class NoiseAwareAugmentation(nn.Module):
+    def __init__(self, noise_std=0.01, bw_amplitude=0.05):
+        super(NoiseAwareAugmentation, self).__init__()
+        self.noise_std = noise_std
+        self.bw_amplitude = bw_amplitude
+        
+    def forward(self, x):
+        if not self.training:
+            return x
+            
+        # x is assumed to be (Batch, Seq, Features)
+        if x.dim() == 3:
+            batch, seq, features = x.shape
+            
+            # Add Gaussian noise
+            noise = torch.randn_like(x) * self.noise_std
+            
+            # Add baseline wander (low freq sine)
+            t = torch.arange(seq, dtype=x.dtype, device=x.device) / seq
+            cycles = torch.empty(batch, 1, features, device=x.device).uniform_(1, 5)
+            phase = torch.empty(batch, 1, features, device=x.device).uniform_(0, 2*np.pi)
+            
+            t_expand = t.unsqueeze(0).unsqueeze(2)
+            bw = self.bw_amplitude * torch.sin(2 * np.pi * cycles * t_expand + phase)
+            
+            return x + noise + bw
+        return x
+
+class HybridLoss(nn.Module):
+    def __init__(self, lambda_entropy=0.1):
+        super(HybridLoss, self).__init__()
+        self.lambda_entropy = lambda_entropy
+        self.ce_loss = nn.CrossEntropyLoss()
+        
+    def forward(self, logits, entropies, targets):
+        ce = self.ce_loss(logits, targets)
+        # Minimize entropy: penalize large entropy to encourage clear states
+        entropy_loss = entropies.mean()
+        return ce + self.lambda_entropy * entropy_loss
+
+class MultiScaleModalityBlock(nn.Module):
+    def __init__(self, in_channels=1, out_features=8):
+        super(MultiScaleModalityBlock, self).__init__()
+        self.conv3 = nn.Sequential(
+            nn.Conv1d(in_channels, 16, kernel_size=3, padding=1),
+            nn.BatchNorm1d(16),
+            nn.ReLU()
+        )
+        self.conv5 = nn.Sequential(
+            nn.Conv1d(in_channels, 16, kernel_size=5, padding=2),
+            nn.BatchNorm1d(16),
+            nn.ReLU()
+        )
+        self.conv7 = nn.Sequential(
+            nn.Conv1d(in_channels, 16, kernel_size=7, padding=3),
+            nn.BatchNorm1d(16),
+            nn.ReLU()
+        )
+        # Concatenate: 16+16+16 = 48 -> AdaptiveAvgPool1d(1) -> Linear -> 8
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.proj = nn.Linear(48, out_features)
+        
+    def forward(self, x):
+        # x: (Batch, 1, Seq)
+        c3 = self.conv3(x)
+        c5 = self.conv5(x)
+        c7 = self.conv7(x)
+        fused = torch.cat([c3, c5, c7], dim=1) # (Batch, 48, Seq)
+        pooled = self.pool(fused).squeeze(-1) # (Batch, 48)
+        return self.proj(pooled) # (Batch, out_features)
+
+class QuantumClassifierBackend(nn.Module):
+    def __init__(self, num_qubits=8, num_layers=3, num_classes=3):
+        super(QuantumClassifierBackend, self).__init__()
+        self.num_qubits = num_qubits
+        self.num_layers = num_layers
+        self.num_classes = num_classes
+        
+        self.dev = qml.device("default.qubit", wires=self.num_qubits)
+        self.weights = nn.Parameter(torch.randn(num_layers, num_qubits, 3))
+        
+        @qml.qnode(self.dev, interface="torch")
+        def _qnode(inputs, weights):
+            # Data Re-uploading architecture
+            for i in range(self.num_layers):
+                qml.AngleEmbedding(inputs, wires=range(self.num_qubits))
+                qml.StronglyEntanglingLayers(weights[i:i+1], wires=range(self.num_qubits))
+                
+            # Expectation values for classification + Von Neumann Entropy for regularization
+            exp_vals = [qml.expval(qml.PauliZ(w)) for w in range(self.num_classes)]
+            entropy = qml.vn_entropy(wires=range(self.num_qubits // 2))
+            return tuple(exp_vals) + (entropy,)
+            
+        self.qnode = _qnode
+        
+    def forward(self, x):
+        # x: (Batch, num_qubits)
+        x = torch.tanh(x) * np.pi # scale to [-pi, pi]
+        
+        batch_size = x.shape[0]
+        logits = []
+        entropies = []
+        
+        for i in range(batch_size):
+            res = self.qnode(x[i], self.weights)
+            # res is a tuple of (num_classes + 1) tensors
+            res_t = torch.stack(res)
+            logits.append(res_t[:self.num_classes])
+            entropies.append(res_t[-1])
+            
+        logits = torch.stack(logits) # (Batch, num_classes)
+        entropies = torch.stack(entropies) # (Batch,)
+        
+        return logits, entropies
+
+class MultiScaleQuantumModel(nn.Module):
+    def __init__(self, num_features=5, num_classes=3):
+        super(MultiScaleQuantumModel, self).__init__()
+        self.aug = NoiseAwareAugmentation()
+        # Create a block for each modality
+        self.blocks = nn.ModuleList([
+            MultiScaleModalityBlock(in_channels=1, out_features=8)
+            for _ in range(num_features)
+        ])
+        # Project concatenated modalities to 8 features
+        self.proj = nn.Sequential(
+            nn.Linear(num_features * 8, 32),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(32, 8)
+        )
+        self.quantum_backend = QuantumClassifierBackend(num_qubits=8, num_layers=3, num_classes=num_classes)
+        
+    def forward(self, x):
+        # x: (Batch, Seq, Features)
+        x = self.aug(x)
+        # Permute for CNN: (Batch, Features, Seq)
+        x_perm = x.permute(0, 2, 1)
+        
+        modality_features = []
+        for i, block in enumerate(self.blocks):
+            f_i = block(x_perm[:, i:i+1, :]) # (Batch, 8)
+            modality_features.append(f_i)
+            
+        fused = torch.cat(modality_features, dim=1) # (Batch, 40)
+        proj_features = self.proj(fused) # (Batch, 8)
+        
+        return self.quantum_backend(proj_features)
+
+class LSTMQuantumModel(nn.Module):
+    def __init__(self, num_features=5, hidden_size=64, num_layers=2, num_classes=3, dropout=0.3):
+        super(LSTMQuantumModel, self).__init__()
+        self.aug = NoiseAwareAugmentation()
+        self.lstm = nn.LSTM(
+            input_size=num_features,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout if num_layers > 1 else 0
+        )
+        self.proj = nn.Sequential(
+            nn.Linear(hidden_size * 2, 32),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(32, 8)
+        )
+        self.quantum_backend = QuantumClassifierBackend(num_qubits=8, num_layers=3, num_classes=num_classes)
+        
+    def forward(self, x):
+        x = self.aug(x)
+        lstm_out, _ = self.lstm(x)
+        pooled = lstm_out.mean(dim=1) # (Batch, Hidden*2)
+        proj_features = self.proj(pooled) # (Batch, 8)
+        return self.quantum_backend(proj_features)
+
+class CNNLSTMQuantumModel(nn.Module):
+    def __init__(self, num_features=5, hidden_size=64, num_layers=2, num_classes=3, dropout=0.3):
+        super(CNNLSTMQuantumModel, self).__init__()
+        self.aug = NoiseAwareAugmentation()
+        self.cnn = nn.Sequential(
+            nn.Conv1d(num_features, 64, kernel_size=5, padding=2),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Conv1d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.MaxPool1d(2)
+        )
+        self.lstm = nn.LSTM(
+            input_size=128,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout if num_layers > 1 else 0
+        )
+        self.proj = nn.Sequential(
+            nn.Linear(hidden_size * 2, 32),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(32, 8)
+        )
+        self.quantum_backend = QuantumClassifierBackend(num_qubits=8, num_layers=3, num_classes=num_classes)
+        
+    def forward(self, x):
+        x = self.aug(x)
+        x_cnn = x.permute(0, 2, 1)
+        x_cnn = self.cnn(x_cnn)
+        x_lstm_in = x_cnn.permute(0, 2, 1)
+        lstm_out, _ = self.lstm(x_lstm_in)
+        last_out = lstm_out[:, -1, :] # (Batch, Hidden*2)
+        proj_features = self.proj(last_out)
+        return self.quantum_backend(proj_features)
+
+class TransformerQuantumModel(nn.Module):
+    def __init__(self, num_features=5, d_model=64, nhead=8, num_layers=2, dim_feedforward=128, num_classes=3, dropout=0.1):
+        super(TransformerQuantumModel, self).__init__()
+        self.aug = NoiseAwareAugmentation()
+        self.embedding = nn.Linear(num_features, d_model)
+        self.pos_encoder = PositionalEncoding(d_model, dropout)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, 
+            nhead=nhead, 
+            dim_feedforward=dim_feedforward, 
+            dropout=dropout,
+            batch_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.proj = nn.Sequential(
+            nn.Linear(d_model, 32),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(32, 8)
+        )
+        self.quantum_backend = QuantumClassifierBackend(num_qubits=8, num_layers=3, num_classes=num_classes)
+        
+    def forward(self, x):
+        x = self.aug(x)
+        x_emb = self.embedding(x)
+        x_pos = self.pos_encoder(x_emb)
+        x_enc = self.transformer_encoder(x_pos)
+        pooled = x_enc.mean(dim=1)
+        proj_features = self.proj(pooled)
+        return self.quantum_backend(proj_features)
+
+
 if __name__ == "__main__":
     import os
     os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -296,3 +597,26 @@ if __name__ == "__main__":
     baseline = ClassicalBaseline()
     out_baseline = baseline(dummy_input)
     print("Baseline Output Shape:", out_baseline.shape)
+
+    print("\nTesting Multi-Scale CNN Model...")
+    mscnn = MultiScaleCNNModel()
+    out_mscnn = mscnn(dummy_input)
+    print("Multi-Scale CNN Output Shape:", out_mscnn.shape)
+
+    print("\nTesting Hybrid Quantum-Classical Models...")
+    try:
+        models = [
+            ("MultiScale Quantum", MultiScaleQuantumModel()),
+            ("LSTM Quantum", LSTMQuantumModel()),
+            ("CNN-LSTM Quantum", CNNLSTMQuantumModel()),
+            ("Transformer Quantum", TransformerQuantumModel())
+        ]
+        dummy_targets = torch.randint(0, 3, (batch_size,))
+        criterion = HybridLoss()
+        
+        for name, model in models:
+            logits, entropies = model(dummy_input)
+            loss = criterion(logits, entropies, dummy_targets)
+            print(f"{name} Output Shape: {logits.shape}, Entropy Avg: {entropies.mean().item():.4f}, Loss: {loss.item():.4f}")
+    except Exception as e:
+        print(f"Error testing quantum models: {e}")

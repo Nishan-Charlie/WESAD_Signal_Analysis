@@ -1,89 +1,95 @@
-# Multimodal Quantum Fusion
+# 🌌 Multimodal Quantum Signal Fusion
 
-A Hybrid Quantum-Classical Neural Network designed to fuse multimodal physiological data (ECG, EDA, EMG, Resp) for state classification (Baseline, Stress, Amusement).
+A high-performance Physiological Signal Analysis & Stress Detection system designed for the **WESAD** dataset. This project integrates classical Deep Learning architectures with Quantum Fourier Transforms (QFT) and advanced signal processing pipelines.
+
+---
 
 ## 🧠 Project Overview
 
-This project implements a novel architecture that combines the feature extraction power of classical Deep Learning with the high-dimensional fusion capabilities of Quantum Computing.
+This project implements a robust framework for classifying human stress states (Baseline, Stress, Amusement) using multimodal chest-worn sensors. It bridges the gap between state-of-the-art temporal modeling and quantum-inspired feature fusion.
 
-### Key Components
+### 📊 Dataset: WESAD (Chest)
+We utilize 5 synchronized modalities recorded at high frequencies, downsampled to **100Hz** for efficient deep learning processing:
+1.  **ECG**: Electrocardiogram (Heart activity)
+2.  **EDA**: Electrodermal Activity (Skin conductance/Sweat)
+3.  **EMG**: Electromyogram (Muscle activity)
+4.  **Resp**: Respiration (Breathing patterns)
+5.  **Temp**: Skin Temperature
 
-1.  **Independent Feature Extraction (Classical)**:
-    - **Input**: 4 Channels (ECG, EDA, EMG, Resp).
-    - **Architecture**: Each channel is processed by a dedicated **1D-CNN + LSTM** branch to extract temporal features.
-    - **Output**: 32-dimensional feature vector per channel.
-2.  **Quantum Projection (Bottleneck)**:
-    - The concatenated features (128 total) are compressed into **8 quantum-ready features** via a classical Dense Layer.
-3.  **8-Qubit Quantum Fusion Layer**:
-    - **Encoding**: Data is embedded into the quantum state using **Amplitude Encoding** (via RX gates).
-    - **Entanglement**: A custom **Strongly Entangling Layer** structure with increasing connectivity depth (Nearest Neighbor $\rightarrow$ Distant $\rightarrow$ Global) allows for complex feature interaction.
-    - **Measurement**: Expectation values of Pauli-Z operators are measured for all 8 qubits.
-4.  **Classification**:
-    - A final classical Linear layer maps the 8 quantum outputs to the 3 target classes.
+---
 
-## 📂 File Structure
+## 🛠️ Model Zoo
 
-```
-MultiModal_Quantum_Fusion/
-├── model.py           # Contains the Hybrid Model Architecture (ClassicalBranch + Fusion)
-├── train.py           # Training script with dummy data generation and training loop
-├── requirements.txt   # Python dependencies
-└── README.md          # Project Documentation
-```
+The system supports 5 powerful architectures, easily toggled via command-line arguments:
+
+| Model | Architecture Description |
+| :--- | :--- |
+| **`lstm`** | Bidirectional LSTM with sequence mean-pooling for long-term temporal dependencies. |
+| **`cnnlstm`** | 1D-CNN for local feature extraction followed by a Bi-LSTM layer. |
+| **`transformer`** | Multi-head Self-Attention with Positional Encoding and Global Average Pooling. |
+| **`multiscale`** | Parallel 1D-CNNs (Kernels 3, 7, 11) to capture multi-resolution temporal features. |
+| **`baseline`** | A complex multi-branch MS-CNN with Temporal Self-Attention for each modality. |
+
+---
 
 ## 🚀 Getting Started
 
-### Prerequisites
-
-- Python 3.8+
-- PyTorch
-- PennyLane
-- Target Device: CPU or GPU (CUDA)
-
-### Installation
-
-1.  Clone the repository or download the files.
-2.  Install the required dependencies:
-
-    ```bash
-    pip install -r requirements.txt
-    ```
-
-### Usage
-
-To train the model (currently set up with dummy data for verification):
-
+### 1. Installation
+Ensure you have a Python environment (Conda recommended) with the following dependencies:
 ```bash
-python train.py
+pip install torch qiskit qiskit-aer streamlit plotly pywt scikit-learn seaborn matplotlib
 ```
 
-The script will:
+### 2. Training (LOSO Framework)
+We use a **15-fold Leave-One-Subject-Out (LOSO)** evaluation to ensure cross-subject generalization.
 
-1.  Initialize the hybrid model.
-2.  Generate random dummy data for 4 channels.
-3.  Run a training loop for 5 epochs.
-4.  Output the Loss and Accuracy per epoch.
+**Run the training pipeline:**
+```powershell
+# Train the Multi-Scale CNN (Recommended)
+python train_advanced.py --model multiscale --window_sec 3 --epochs 50
 
-## 🛠️ Model Architecture Details
+# Train the Transformer
+python train_advanced.py --model transformer --window_sec 3
 
-### Classical Branch
+# Run a quick demo (Fold 0 only)
+python train_advanced.py --model cnnlstm --demo
+```
 
-- **Conv1d**: Kernel size 3, ReLU activation, MaxPool.
-- **LSTM**: Captures sequence dependencies from the CNN output.
+### 3. Interactive Quantum Dashboard
+Explore signals, analyze frequencies, and simulate quantum transforms in a live web-app.
+```powershell
+streamlit run dashboard.py
+```
 
-### Quantum Circuit (PennyLane)
+**Dashboard Features:**
+- **Signals Explorer**: Interactive Plotly charts for all 5 modalities.
+- **Time-Frequency**: Spectrograms (STFT) and Wavelet (CWT) Scalograms.
+- **Rhythms**: Extraction of Alpha, Beta, Delta, and Theta bands.
+- **Preprocessing Lab**: Step-by-step Notch/Bandpass filtering and ICA artifact removal.
+- **Quantum QFT**: Real-time Qiskit simulation of the Quantum Fourier Transform.
 
-- **Qubits**: 8.
-- **Depth**: 3 Layers.
-- **Ansatz**:
-  - _Rotations_: Trainable parameters.
-  - _CNOTs_: Entangles qubits with varying strides (1, 2, 3) to ensure global information flow.
+---
 
-## 📊 Classes
+## 📈 Evaluation & Results
 
-- 0: Baseline
-- 1: Stress
-- 2: Amusement
-"# WESAD_Psychological-Analysis" 
-"# WESAD_Psychological-Analysis" 
-"# WESAD_Signal_Analysis" 
+Training results, including confusion matrices and LOSO summaries, are automatically saved to:
+`output/advanced_loso/<model_name>_<window_size>s/`
+
+**To visualize the cross-subject performance:**
+```powershell
+python plot_loso_results.py --model multiscale_3s
+```
+
+## ⚛️ Quantum Integration
+The project features a standalone module for **Quantum Fourier Transforms (QFT)**. By mapping physiological amplitudes to quantum statevectors, we explore high-dimensional frequency encoding that enables exponential speedup in future quantum-hardware deployments.
+
+---
+
+## 📂 File Structure
+
+- `wesad_dataset.py`: Multi-modal data loader and windowing logic.
+- `advanced_models.py`: Core PyTorch implementations of all architectures.
+- `train_advanced.py`: The 15-fold LOSO training engine.
+- `dashboard.py`: Streamlit-based interactive analysis suite.
+- `plot_loso_results.py`: Global performance visualization tool.
+- `WESAD/`: Raw dataset directory (Expected structure: `S2/S2.pkl`, etc.)
