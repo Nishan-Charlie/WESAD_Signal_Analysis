@@ -2,6 +2,7 @@ import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import pennylane as qml
 
@@ -122,7 +123,7 @@ class PositionalEncoding(nn.Module):
 
 
 class TransformerModel(nn.Module):
-    def __init__(self, num_features=5, d_model=64, nhead=8, num_layers=3, dim_feedforward=256, num_classes=3, dropout=0.1):
+    def __init__(self, num_features=5, d_model=64, nhead=8, num_layers=3, dim_feedforward=256, num_classes=3, dropout=0.1, attn_type='flash'):
         super(TransformerModel, self).__init__()
         
         # 1. Input Projection
@@ -132,14 +133,17 @@ class TransformerModel(nn.Module):
         self.pos_encoder = PositionalEncoding(d_model, dropout)
         
         # 3. Transformer Encoder
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, 
-            nhead=nhead, 
-            dim_feedforward=dim_feedforward, 
-            dropout=dropout,
-            batch_first=True
-        )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.attn_type = attn_type
+        if attn_type == 'linear':
+            self.layers = nn.ModuleList([FastLinearAttentionLayer(d_model, nhead, dim_feedforward, dropout) for _ in range(num_layers)])
+            self.transformer_encoder = None
+        elif attn_type == 'flash':
+            self.layers = nn.ModuleList([FastTransformerEncoderLayer(d_model, nhead, dim_feedforward, dropout) for _ in range(num_layers)])
+            self.transformer_encoder = None
+        else:
+            encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward, dropout=dropout, batch_first=True)
+            self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+            self.layers = None
         
         # 4. Classification Head
         self.classifier = nn.Sequential(
@@ -161,14 +165,128 @@ class TransformerModel(nn.Module):
         x = self.pos_encoder(x)
         
         # Transformer Encoder
-        x = self.transformer_encoder(x) # (Batch, Seq, d_model)
+        if self.layers is not None:
+            for layer in self.layers:
+                x = layer(x)
+            x_enc = x
+        else:
+            x_enc = self.transformer_encoder(x) # (Batch, Seq, d_model)
         
         # Global Average Pooling across the sequence dimension
-        x = x.mean(dim=1) # (Batch, d_model)
+        x = x_enc.mean(dim=1) # (Batch, d_model)
         
         logits = self.classifier(x)
         return logits
 
+
+class SEBlock1D(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super(SEBlock1D, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        reduced = max(4, channels // reduction)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, reduced, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(reduced, channels, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1)
+        return x * y.expand_as(x)
+
+class FastTransformerEncoderLayer(nn.Module):
+    def __init__(self, d_model, nhead, dim_feedforward=256, dropout=0.1):
+        super(FastTransformerEncoderLayer, self).__init__()
+        self.nhead = nhead
+        self.d_model = d_model
+        assert d_model % nhead == 0
+        self.head_dim = d_model // nhead
+        
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model)
+        )
+        
+    def forward(self, src):
+        B, S, E = src.shape
+        q = self.q_proj(src).view(B, S, self.nhead, self.head_dim).transpose(1, 2)
+        k = self.k_proj(src).view(B, S, self.nhead, self.head_dim).transpose(1, 2)
+        v = self.v_proj(src).view(B, S, self.nhead, self.head_dim).transpose(1, 2)
+        
+        attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
+        attn_out = attn_out.transpose(1, 2).reshape(B, S, E)
+        attn_out = self.out_proj(attn_out)
+        
+        src = src + self.dropout1(attn_out)
+        src = self.norm1(src)
+        ff_out = self.ff(src)
+        src = src + self.dropout2(ff_out)
+        return self.norm2(src)
+
+class FastLinearAttentionLayer(nn.Module):
+    def __init__(self, d_model, nhead, dim_feedforward=256, dropout=0.1):
+        super(FastLinearAttentionLayer, self).__init__()
+        self.nhead = nhead
+        self.d_model = d_model
+        assert d_model % nhead == 0
+        self.head_dim = d_model // nhead
+        
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model)
+        )
+        
+    def _elu_map(self, x):
+        return F.elu(x) + 1.0
+
+    def forward(self, src):
+        B, S, E = src.shape
+        q = self.q_proj(src).view(B, S, self.nhead, self.head_dim).transpose(1, 2)
+        k = self.k_proj(src).view(B, S, self.nhead, self.head_dim).transpose(1, 2)
+        v = self.v_proj(src).view(B, S, self.nhead, self.head_dim).transpose(1, 2)
+        
+        # Apply kernel feature map
+        q_m = self._elu_map(q)
+        k_m = self._elu_map(k)
+        
+        # O(N) evaluation strategy
+        kv = torch.matmul(k_m.transpose(-2, -1), v)
+        z = 1 / (torch.matmul(q_m, k_m.sum(dim=-2, keepdim=True).transpose(-2, -1)) + 1e-6)
+        
+        attn_out = torch.matmul(q_m, kv) * z
+        attn_out = attn_out.transpose(1, 2).reshape(B, S, E)
+        attn_out = self.out_proj(attn_out)
+        
+        src = src + self.dropout1(attn_out)
+        src = self.norm1(src)
+        ff_out = self.ff(src)
+        src = src + self.dropout2(ff_out)
+        return self.norm2(src)
 
 class MultiScale1DCNN(nn.Module):
     def __init__(self, in_channels=1, out_channels=16):
@@ -377,7 +495,8 @@ class MultiScaleModalityBlock(nn.Module):
             nn.BatchNorm1d(16),
             nn.ReLU()
         )
-        # Concatenate: 16+16+16 = 48 -> AdaptiveAvgPool1d(1) -> Linear -> 8
+        # Concatenate: 16+16+16 = 48 -> SEBlock -> AdaptiveAvgPool1d(1) -> Linear -> 8
+        self.se = SEBlock1D(48)
         self.pool = nn.AdaptiveAvgPool1d(1)
         self.proj = nn.Linear(48, out_features)
         
@@ -387,6 +506,7 @@ class MultiScaleModalityBlock(nn.Module):
         c5 = self.conv5(x)
         c7 = self.conv7(x)
         fused = torch.cat([c3, c5, c7], dim=1) # (Batch, 48, Seq)
+        fused = self.se(fused)
         pooled = self.pool(fused).squeeze(-1) # (Batch, 48)
         return self.proj(pooled) # (Batch, out_features)
 
@@ -536,19 +656,24 @@ class CNNLSTMQuantumModel(nn.Module):
         return self.quantum_backend(proj_features)
 
 class TransformerQuantumModel(nn.Module):
-    def __init__(self, num_features=5, d_model=64, nhead=8, num_layers=2, dim_feedforward=128, num_classes=3, dropout=0.1):
+    def __init__(self, num_features=5, d_model=64, nhead=8, num_layers=2, dim_feedforward=128, num_classes=3, dropout=0.1, attn_type='flash'):
         super(TransformerQuantumModel, self).__init__()
         self.aug = NoiseAwareAugmentation()
         self.embedding = nn.Linear(num_features, d_model)
         self.pos_encoder = PositionalEncoding(d_model, dropout)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, 
-            nhead=nhead, 
-            dim_feedforward=dim_feedforward, 
-            dropout=dropout,
-            batch_first=True
-        )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        self.attn_type = attn_type
+        if attn_type == 'linear':
+            self.layers = nn.ModuleList([FastLinearAttentionLayer(d_model, nhead, dim_feedforward, dropout) for _ in range(num_layers)])
+            self.transformer_encoder = None
+        elif attn_type == 'flash':
+            self.layers = nn.ModuleList([FastTransformerEncoderLayer(d_model, nhead, dim_feedforward, dropout) for _ in range(num_layers)])
+            self.transformer_encoder = None
+        else:
+            encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward, dropout=dropout, batch_first=True)
+            self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+            self.layers = None
+            
         self.proj = nn.Sequential(
             nn.Linear(d_model, 32),
             nn.ReLU(),
@@ -561,7 +686,14 @@ class TransformerQuantumModel(nn.Module):
         x = self.aug(x)
         x_emb = self.embedding(x)
         x_pos = self.pos_encoder(x_emb)
-        x_enc = self.transformer_encoder(x_pos)
+        
+        if self.layers is not None:
+            for layer in self.layers:
+                x_pos = layer(x_pos)
+            x_enc = x_pos
+        else:
+            x_enc = self.transformer_encoder(x_pos)
+            
         pooled = x_enc.mean(dim=1)
         proj_features = self.proj(pooled)
         return self.quantum_backend(proj_features)

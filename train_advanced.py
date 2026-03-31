@@ -118,7 +118,7 @@ def train_one_fold(fold_idx, model_type, args, device):
     elif model_type == 'cnnlstm':
         model = CNNLSTMModel(num_features=5, num_classes=3).to(device)
     elif model_type == 'transformer':
-        model = TransformerModel(num_features=5, num_classes=3).to(device)
+        model = TransformerModel(num_features=5, num_classes=3, attn_type=args.get('attn_type', 'flash')).to(device)
     elif model_type == 'baseline':
         model = ClassicalBaseline(num_features=5, num_classes=3).to(device)
     elif model_type == 'multiscale':
@@ -130,7 +130,7 @@ def train_one_fold(fold_idx, model_type, args, device):
     elif model_type == 'cnn-lstm-quantum':
         model = CNNLSTMQuantumModel(num_features=5, num_classes=3).to(device)
     elif model_type == 'transformer-quantum':
-        model = TransformerQuantumModel(num_features=5, num_classes=3).to(device)
+        model = TransformerQuantumModel(num_features=5, num_classes=3, attn_type=args.get('attn_type', 'flash')).to(device)
     else:
         raise ValueError(f"Unknown model type: {model_type}")
 
@@ -257,6 +257,8 @@ def main():
         'lstm-quantum', 'cnn-lstm-quantum', 'transformer-quantum', 'multiscale-quantum'
     ], default='lstm')
     parser.add_argument("--lambda_entropy", type=float, default=0.1, help="Weight for quantum entanglement loss")
+    parser.add_argument("--attn_type",    type=str,   choices=['flash', 'linear', 'standard'], default='flash',
+                        help="Attention mechanism for Transformer models")
     parser.add_argument("--epochs",       type=int,   default=50)
     parser.add_argument("--batch_size",   type=int,   default=64)
     parser.add_argument("--lr",           type=float, default=1e-3)
