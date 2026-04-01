@@ -125,6 +125,28 @@ class TransformerBackbone(nn.Module):
             x = layer(x)
         return x.mean(dim=1) # (Batch, d_model)
 
+class CNNLSTMBackbone(nn.Module):
+    def __init__(self, in_channels, hidden_size=64, num_layers=1, dropout=0.3):
+        super(CNNLSTMBackbone, self).__init__()
+        self.cnn = nn.Sequential(
+            nn.Conv1d(in_channels, 32, kernel_size=5, padding=2),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Conv1d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(50) # Fixed length for LSTM
+        )
+        self.lstm = nn.LSTM(64, hidden_size, num_layers, batch_first=True, bidirectional=True)
+    def forward(self, x):
+        # x: (Batch, Seq, Feats) -> (Batch, Feats, Seq)
+        x = x.permute(0, 2, 1)
+        x = self.cnn(x)
+        x = x.permute(0, 2, 1) # (Batch, Seq', 64)
+        out, _ = self.lstm(x)
+        return out[:, -1, :] # (Batch, 2*hidden_size)
+
 # --- Backends ---
 
 class QuantumClassifierBackend(nn.Module):
@@ -162,6 +184,7 @@ class UniversalMultimodalModel(nn.Module):
             if backbone_type == 'lstm': return LSTMBackbone(in_ch)
             if backbone_type == 'cnn': return CNNBackbone(in_ch)
             if backbone_type == 'transformer': return TransformerBackbone(in_ch)
+            if backbone_type == 'cnnlstm': return CNNLSTMBackbone(in_ch)
             return CNNBackbone(in_ch)
 
         if fusion_type == 'early':
@@ -185,6 +208,7 @@ class UniversalMultimodalModel(nn.Module):
         if self.backbone_type == 'lstm': return 128
         if self.backbone_type == 'cnn': return 48
         if self.backbone_type == 'transformer': return 64
+        if self.backbone_type == 'cnnlstm': return 128
         return 48
 
     def forward(self, x):
