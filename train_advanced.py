@@ -6,13 +6,12 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from wesad_dataset import WESADDataset
 from advanced_models import (
-    LSTMModel, CNNLSTMModel, TransformerModel, ClassicalBaseline, MultiScaleCNNModel,
-    MultiScaleQuantumModel, LSTMQuantumModel, CNNLSTMQuantumModel, TransformerQuantumModel,
-    HybridLoss
+    UniversalMultimodalModel, HybridLoss, NoiseAwareAugmentation
 )
 import time
 import json
 import numpy as np
+from tqdm import tqdm
 from sklearn.metrics import precision_recall_fscore_support, accuracy_score, confusion_matrix
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -44,13 +43,13 @@ def compute_class_weights(dataset, device):
     return torch.tensor(weights, dtype=torch.float32).to(device)
 
 
-def evaluate(model, loader, device, criterion):
+def evaluate(model, loader, device, criterion, desc="Evaluating"):
     model.eval()
     all_preds, all_labels = [], []
     total_loss = 0
 
     with torch.no_grad():
-        for data, label in loader:
+        for data, label in tqdm(loader, desc=desc, leave=False):
             data, label = data.to(device), label.to(device)
             outputs = model(data)
             if isinstance(outputs, tuple):
@@ -83,7 +82,21 @@ def evaluate(model, loader, device, criterion):
 def train_one_fold(fold_idx, model_type, args, device):
     """Train and evaluate a single LOSO fold."""
     train_subs, val_subs, test_subs = get_loso_split(fold_idx)
-    model_id = f"{model_type}_{args['window_sec']}s"
+    
+    # Model ID generation: {backbone}_{fusion}_{backend}_{window}s
+    backbone = args.get('backbone', model_type)
+    fusion = args.get('fusion', 'mid')
+    backend = 'quantum' if args.get('quantum', False) or 'quantum' in model_type else 'classical'
+    
+    # Special case: if user uses legacy --model names, parse them
+    if model_type in ['lstm', 'cnnlstm', 'transformer', 'baseline', 'multiscale']:
+        backbone = model_type if model_type != 'baseline' else 'cnn'
+        backend = 'classical'
+    elif 'quantum' in model_type:
+        backbone = model_type.replace('-quantum', '').replace('multiscale', 'cnn')
+        backend = 'quantum'
+
+    model_id = f"{backbone}_{fusion}_{backend}_{args['window_sec']}s"
     OUTPUT_FOLDER = os.path.join("output", "advanced_loso", model_id, f"fold_{fold_idx}")
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
@@ -112,29 +125,17 @@ def train_one_fold(fold_idx, model_type, args, device):
     # Class-weighted loss (defined after model selection below, with label_smoothing)
     class_weights = compute_class_weights(train_ds, device)
 
-    # Model
-    if model_type == 'lstm':
-        model = LSTMModel(num_features=5, num_classes=3).to(device)
-    elif model_type == 'cnnlstm':
-        model = CNNLSTMModel(num_features=5, num_classes=3).to(device)
-    elif model_type == 'transformer':
-        model = TransformerModel(num_features=5, num_classes=3, attn_type=args.get('attn_type', 'flash')).to(device)
-    elif model_type == 'baseline':
-        model = ClassicalBaseline(num_features=5, num_classes=3).to(device)
-    elif model_type == 'multiscale':
-        model = MultiScaleCNNModel(num_features=5, num_classes=3).to(device)
-    elif model_type == 'multiscale-quantum':
-        model = MultiScaleQuantumModel(num_features=5, num_classes=3).to(device)
-    elif model_type == 'lstm-quantum':
-        model = LSTMQuantumModel(num_features=5, num_classes=3).to(device)
-    elif model_type == 'cnn-lstm-quantum':
-        model = CNNLSTMQuantumModel(num_features=5, num_classes=3).to(device)
-    elif model_type == 'transformer-quantum':
-        model = TransformerQuantumModel(num_features=5, num_classes=3, attn_type=args.get('attn_type', 'flash')).to(device)
-    else:
-        raise ValueError(f"Unknown model type: {model_type}")
+    # Unified Model Initialization
+    is_quantum = backend == 'quantum'
+    model = UniversalMultimodalModel(
+        backbone_type=backbone,
+        fusion_type=fusion,
+        is_quantum=is_quantum,
+        num_features=5,
+        num_classes=3
+    ).to(device)
 
-    is_quantum = "quantum" in model_type
+    is_quantum = is_quantum # already defined above
 
 
     optimizer = optim.AdamW(model.parameters(), lr=args['lr'], weight_decay=args['weight_decay'])
@@ -160,7 +161,8 @@ def train_one_fold(fold_idx, model_type, args, device):
         model.train()
         total_loss = 0
 
-        for data, label in train_loader:
+        pbar = tqdm(train_loader, desc=f"Ep {epoch+1:02d}/{args['epochs']} [Train]", leave=False)
+        for data, label in pbar:
             data, label = data.to(device), label.to(device)
             optimizer.zero_grad()
             outputs = model(data)
@@ -172,9 +174,11 @@ def train_one_fold(fold_idx, model_type, args, device):
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            total_loss += loss.item()
+            loss_val = loss.item()
+            total_loss += loss_val
+            pbar.set_postfix({"loss": f"{loss_val:.4f}"})
 
-        val_m = evaluate(model, val_loader, device, criterion)
+        val_m = evaluate(model, val_loader, device, criterion, desc="Validation")
         avg_train = total_loss / len(train_loader)
         lr_now = optimizer.param_groups[0]['lr']
 
@@ -216,7 +220,7 @@ def train_one_fold(fold_idx, model_type, args, device):
 
     # -- Test evaluation --
     model.load_state_dict(torch.load(os.path.join(OUTPUT_FOLDER, "best_model.pth"), weights_only=False))
-    test_m = evaluate(model, test_loader, device, criterion)
+    test_m = evaluate(model, test_loader, device, criterion, desc="Testing")
 
     print(f"\n  >>> Fold {fold_idx} Test ({test_subs[0]}): "
           f"Acc={test_m['accuracy']:.4f} | F1={test_m['f1']:.4f} | "
@@ -254,8 +258,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model",        type=str,   choices=[
         'lstm', 'cnnlstm', 'transformer', 'baseline', 'multiscale',
-        'lstm-quantum', 'cnn-lstm-quantum', 'transformer-quantum', 'multiscale-quantum'
-    ], default='lstm')
+        'lstm-quantum', 'cnn-lstm-quantum', 'transformer-quantum', 'multiscale-quantum', 'universal'
+    ], default='universal')
+    parser.add_argument("--backbone",     type=str,   choices=['lstm', 'cnn', 'transformer', 'cnnlstm'], default='cnn')
+    parser.add_argument("--fusion",       type=str,   choices=['early', 'mid', 'late'], default='mid')
+    parser.add_argument("--quantum",      action="store_true", help="Enable Quantum Backend")
     parser.add_argument("--lambda_entropy", type=float, default=0.1, help="Weight for quantum entanglement loss")
     parser.add_argument("--attn_type",    type=str,   choices=['flash', 'linear', 'standard'], default='flash',
                         help="Attention mechanism for Transformer models")
